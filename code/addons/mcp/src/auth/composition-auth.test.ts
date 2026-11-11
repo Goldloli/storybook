@@ -8,10 +8,7 @@ const VALID_MANIFEST =
 
 type Route = (init?: RequestInit) => Response | Promise<Response>;
 
-/**
- * A `fetch` that answers by URL (and `POST <url>` for posts), so refs checked in parallel don't
- * depend on call order. Unknown URLs answer 404.
- */
+// Answers by URL (`POST <url>` for posts), so parallel ref checks don't depend on call order.
 function routeFetch(routes: Record<string, Route>) {
   return vi.fn(async (input: string, init?: RequestInit) => {
     const route = (init?.method === 'POST' && routes[`POST ${input}`]) || routes[input];
@@ -38,7 +35,6 @@ function serverMetadata(issuer: string) {
   };
 }
 
-/** Routes for a private ref at `refUrl` whose OAuth server is `https://auth.example.com`. */
 function privateRefRoutes(refUrl: string): Record<string, Route> {
   return {
     [`${refUrl}/manifests/components.json`]: () =>
@@ -50,7 +46,7 @@ function privateRefRoutes(refUrl: string): Record<string, Route> {
   };
 }
 
-/** Never answers until the request is aborted, like a host that accepts and then goes quiet. */
+// Never answers until aborted, like a host that accepts and then goes quiet.
 const hang: Route = (init) =>
   new Promise((_resolve, reject) => {
     init?.signal?.addEventListener('abort', () => reject(init.signal!.reason));

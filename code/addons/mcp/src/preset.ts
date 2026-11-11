@@ -133,8 +133,6 @@ export const experimental_devServer: PresetPropertyFn<
     localAccess,
   });
 
-  // A ref that was unreachable at boot is checked again before a request is answered, and what
-  // that finds (it is private, or has no manifest after all) shapes the answer.
   const currentSources = async () => {
     await compositionAuth.recheckUnreachableRefs();
     return refs.length > 0 ? compositionAuth.buildSources() : sources;
