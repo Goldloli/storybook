@@ -133,8 +133,8 @@ export const experimental_devServer: PresetPropertyFn<
     localAccess,
   });
 
-  const currentSources = async () => {
-    await compositionAuth.recheckUnreachableRefs();
+  const currentSources = () => {
+    void compositionAuth.recheckUnreachableRefs();
     return refs.length > 0 ? compositionAuth.buildSources() : sources;
   };
 
@@ -164,9 +164,9 @@ export const experimental_devServer: PresetPropertyFn<
     return false;
   };
 
-  app!.post(endpoint, async (req, res) => {
+  app!.post(endpoint, (req, res) => {
     if (rejectDisallowedOrigin(req, res)) return;
-    const requestSources = await currentSources();
+    const requestSources = currentSources();
     if (requireAuth(req, res)) return;
     if (rejectNonJsonBody(req, res)) return;
 
@@ -200,10 +200,10 @@ export const experimental_devServer: PresetPropertyFn<
   const isDocsEnabled = docsEnabled && (addonOptions.toolsets?.docs ?? true);
   const isTestEnabled = testSupported && (addonOptions.toolsets?.test ?? true);
 
-  app!.get(endpoint, async (req, res) => {
+  app!.get(endpoint, (req, res) => {
     if (rejectDisallowedOrigin(req, res)) return;
     if (!req.headers['accept']?.includes('text/html')) {
-      const requestSources = await currentSources();
+      const requestSources = currentSources();
       if (requireAuth(req, res)) return;
 
       return mcpServerHandler({

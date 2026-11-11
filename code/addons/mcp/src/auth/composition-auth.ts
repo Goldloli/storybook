@@ -124,10 +124,13 @@ export class CompositionAuth {
       );
       if (due.length === 0) return;
       this.#recheck = (async () => {
-        for (const state of due) {
-          await this.#check(state);
+        try {
+          for (const state of due) {
+            await this.#check(state);
+          }
+        } finally {
+          this.#recheck = null;
         }
-        this.#recheck = null;
       })();
     }
     await this.#recheck;
