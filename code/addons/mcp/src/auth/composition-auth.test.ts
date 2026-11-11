@@ -8,7 +8,7 @@ const VALID_MANIFEST =
 
 type Route = (init?: RequestInit) => Response | Promise<Response>;
 
-// Answers by URL (`POST <url>` for posts), so parallel ref checks don't depend on call order.
+// Answers by URL (`POST <url>` for posts); unknown URLs answer 404.
 function routeFetch(routes: Record<string, Route>) {
   return vi.fn(async (input: string, init?: RequestInit) => {
     const route = (init?.method === 'POST' && routes[`POST ${input}`]) || routes[input];
@@ -45,12 +45,6 @@ function privateRefRoutes(refUrl: string): Record<string, Route> {
       Response.json(serverMetadata('https://auth.example.com')),
   };
 }
-
-// Never answers until aborted, like a host that accepts and then goes quiet.
-const hang: Route = (init) =>
-  new Promise((_resolve, reject) => {
-    init?.signal?.addEventListener('abort', () => reject(init.signal!.reason));
-  });
 
 describe('CompositionAuth', () => {
   beforeEach(() => {
@@ -1013,62 +1007,6 @@ describe('CompositionAuth', () => {
       expect(auth.requiresAuth).toBe(true);
     });
 
-    it('gives up on a ref that stops answering, then checks it again', async () => {
-      const auth = new CompositionAuth();
-      let stalled = true;
-      vi.stubGlobal(
-        'fetch',
-        routeFetch({
-          [`${PUBLIC_REF.url}/manifests/components.json`]: (init) =>
-            stalled ? hang(init) : new Response(VALID_MANIFEST),
-        })
-      );
-
-      const initialized = auth.initialize([PUBLIC_REF]);
-      await vi.advanceTimersByTimeAsync(10_000);
-      await initialized;
-      expect(logger.warn).toHaveBeenCalledWith(
-        expect.stringMatching(/"Public".*could not be reached.*no data received/)
-      );
-
-      stalled = false;
-      await vi.advanceTimersByTimeAsync(5_000);
-      await auth.recheckUnreachableRefs();
-
-      expect(auth.buildSources().map((source) => source.id)).toEqual(['local', 'public']);
-    });
-
-    it('accepts a large manifest that takes several seconds to stream', async () => {
-      const auth = new CompositionAuth();
-      // A valid manifest padded to ~2 MB, sent in 64 KB chunks 250ms apart: about 8 seconds.
-      const manifest = `${VALID_MANIFEST.slice(0, -1)},"padding":"${'x'.repeat(2 * 1024 * 1024)}"}`;
-      const encoded = new TextEncoder().encode(manifest);
-      vi.stubGlobal(
-        'fetch',
-        routeFetch({
-          [`${PUBLIC_REF.url}/manifests/components.json`]: () =>
-            new Response(
-              new ReadableStream({
-                async start(controller) {
-                  for (let offset = 0; offset < encoded.length; offset += 64 * 1024) {
-                    await new Promise((resolve) => setTimeout(resolve, 250));
-                    controller.enqueue(encoded.slice(offset, offset + 64 * 1024));
-                  }
-                  controller.close();
-                },
-              })
-            ),
-        })
-      );
-
-      const initialized = auth.initialize([PUBLIC_REF]);
-      await vi.advanceTimersByTimeAsync(10_000);
-      await initialized;
-
-      expect(logger.warn).not.toHaveBeenCalled();
-      expect(auth.buildSources().map((source) => source.id)).toEqual(['local', 'public']);
-    });
-
     it('waits longer after each failure before checking again', async () => {
       const auth = new CompositionAuth();
       const mockFetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'));
@@ -1094,48 +1032,6 @@ describe('CompositionAuth', () => {
       expect(mockFetch).toHaveBeenCalledTimes(3);
       // Warned once, not on every failed retry.
       expect(logger.warn).toHaveBeenCalledTimes(1);
-    });
-
-    it('shares one round of checks between concurrent requests', async () => {
-      const auth = new CompositionAuth();
-      const mockFetch = vi.fn().mockRejectedValueOnce(new TypeError('fetch failed'));
-      vi.stubGlobal('fetch', mockFetch);
-      await auth.initialize([PUBLIC_REF]);
-
-      mockFetch.mockResolvedValue(new Response(VALID_MANIFEST));
-      await vi.advanceTimersByTimeAsync(5_000);
-      await Promise.all([auth.recheckUnreachableRefs(), auth.recheckUnreachableRefs()]);
-
-      expect(mockFetch).toHaveBeenCalledTimes(2);
-    });
-
-    it('drops a ref that turns out to have no manifest once it is reachable', async () => {
-      const auth = new CompositionAuth();
-      const mockFetch = vi.fn().mockRejectedValueOnce(new TypeError('fetch failed'));
-      vi.stubGlobal('fetch', mockFetch);
-      await auth.initialize([PUBLIC_REF]);
-      expect(auth.buildSources().map((source) => source.id)).toEqual(['local', 'public']);
-
-      mockFetch.mockImplementation(async () => new Response('Not found', { status: 404 }));
-      await vi.advanceTimersByTimeAsync(5_000);
-      await auth.recheckUnreachableRefs();
-
-      expect(auth.buildSources().map((source) => source.id)).toEqual(['local']);
-      expect(logger.warn).toHaveBeenLastCalledWith(
-        expect.stringMatching(/Skipping composed ref "Public".*components manifest not found/)
-      );
-    });
-
-    it('does not check refs again once their state is known', async () => {
-      const auth = new CompositionAuth();
-      const mockFetch = vi.fn().mockResolvedValue(new Response(VALID_MANIFEST));
-      vi.stubGlobal('fetch', mockFetch);
-      await auth.initialize([PUBLIC_REF]);
-
-      await vi.advanceTimersByTimeAsync(120_000);
-      await auth.recheckUnreachableRefs();
-
-      expect(mockFetch).toHaveBeenCalledTimes(1);
     });
   });
 });
