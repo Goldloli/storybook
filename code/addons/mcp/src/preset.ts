@@ -133,6 +133,13 @@ export const experimental_devServer: PresetPropertyFn<
     localAccess,
   });
 
+  // A ref that was unreachable at boot is checked again before a request is answered, and what
+  // that finds (it is private, or has no manifest after all) shapes the answer.
+  const currentSources = async () => {
+    await compositionAuth.recheckUnreachableRefs();
+    return refs.length > 0 ? compositionAuth.buildSources() : sources;
+  };
+
   // Serve .well-known/oauth-protected-resource for MCP auth
   app!.get('/.well-known/oauth-protected-resource', (_req, res) => {
     const wellKnown = compositionAuth.buildWellKnown(`${baseUrl}${endpoint}`);
@@ -159,8 +166,9 @@ export const experimental_devServer: PresetPropertyFn<
     return false;
   };
 
-  app!.post(endpoint, (req, res) => {
+  app!.post(endpoint, async (req, res) => {
     if (rejectDisallowedOrigin(req, res)) return;
+    const requestSources = await currentSources();
     if (requireAuth(req, res)) return;
     if (rejectNonJsonBody(req, res)) return;
 
@@ -172,7 +180,8 @@ export const experimental_devServer: PresetPropertyFn<
       origin,
       basePath,
       endpoint,
-      sources,
+      sources: requestSources,
+      multiSource,
       ...manifestAccessFor(req),
       compositionAuth,
     });
@@ -193,9 +202,10 @@ export const experimental_devServer: PresetPropertyFn<
   const isDocsEnabled = docsEnabled && (addonOptions.toolsets?.docs ?? true);
   const isTestEnabled = testSupported && (addonOptions.toolsets?.test ?? true);
 
-  app!.get(endpoint, (req, res) => {
+  app!.get(endpoint, async (req, res) => {
     if (rejectDisallowedOrigin(req, res)) return;
     if (!req.headers['accept']?.includes('text/html')) {
+      const requestSources = await currentSources();
       if (requireAuth(req, res)) return;
 
       return mcpServerHandler({
@@ -206,7 +216,8 @@ export const experimental_devServer: PresetPropertyFn<
         origin,
         basePath,
         endpoint,
-        sources,
+        sources: requestSources,
+        multiSource,
         ...manifestAccessFor(req),
         compositionAuth,
       });

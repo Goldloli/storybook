@@ -3,6 +3,59 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { CompositionAuth, extractBearerToken } from './composition-auth.ts';
 
+const VALID_MANIFEST =
+  '{"v":1,"components":{"button":{"id":"button","name":"Button","path":"src/Button.tsx"}}}';
+
+type Route = (init?: RequestInit) => Response | Promise<Response>;
+
+/**
+ * A `fetch` that answers by URL (and `POST <url>` for posts), so refs checked in parallel don't
+ * depend on call order. Unknown URLs answer 404.
+ */
+function routeFetch(routes: Record<string, Route>) {
+  return vi.fn(async (input: string, init?: RequestInit) => {
+    const route = (init?.method === 'POST' && routes[`POST ${input}`]) || routes[input];
+    return route ? route(init) : new Response('Not found', { status: 404 });
+  });
+}
+
+function oauthChallenge(resourceMetadataUrl: string) {
+  return new Response('Unauthorized', {
+    status: 401,
+    headers: { 'WWW-Authenticate': `Bearer resource_metadata="${resourceMetadataUrl}"` },
+  });
+}
+
+function resourceMetadata(resource: string, authServer: string) {
+  return { resource, authorization_servers: [authServer] };
+}
+
+function serverMetadata(issuer: string) {
+  return {
+    issuer,
+    authorization_endpoint: `${issuer}/authorize`,
+    token_endpoint: `${issuer}/token`,
+  };
+}
+
+/** Routes for a private ref at `refUrl` whose OAuth server is `https://auth.example.com`. */
+function privateRefRoutes(refUrl: string): Record<string, Route> {
+  return {
+    [`${refUrl}/manifests/components.json`]: () =>
+      oauthChallenge(`${refUrl}/.well-known/oauth-protected-resource`),
+    [`${refUrl}/.well-known/oauth-protected-resource`]: () =>
+      Response.json(resourceMetadata(`${refUrl}/mcp`, 'https://auth.example.com')),
+    'https://auth.example.com/.well-known/oauth-authorization-server': () =>
+      Response.json(serverMetadata('https://auth.example.com')),
+  };
+}
+
+/** Never answers until the request is aborted, like a host that accepts and then goes quiet. */
+const hang: Route = (init) =>
+  new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject(init.signal!.reason));
+  });
+
 describe('CompositionAuth', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -749,60 +802,24 @@ describe('CompositionAuth', () => {
 
       vi.stubGlobal(
         'fetch',
-        vi
-          .fn()
-          // First ref: manifest returns 401
-          .mockResolvedValueOnce({
-            ok: false,
-            status: 401,
-            headers: new Headers({
-              'WWW-Authenticate':
-                'Bearer resource_metadata="https://chromatic.com/.well-known/oauth-protected-resource"',
-            }),
-          })
-          .mockResolvedValueOnce({
-            ok: true,
-            json: () =>
-              Promise.resolve({
-                resource: 'https://chromatic.com/mcp',
-                authorization_servers: ['https://www.chromatic.com'],
-              }),
-          })
-          .mockResolvedValueOnce({
-            ok: true,
-            json: () =>
-              Promise.resolve({
-                issuer: 'https://www.chromatic.com',
-                authorization_endpoint: 'https://www.chromatic.com/authorize',
-                token_endpoint: 'https://www.chromatic.com/token',
-              }),
-          })
-          // Second ref: manifest returns 401 with different server
-          .mockResolvedValueOnce({
-            ok: false,
-            status: 401,
-            headers: new Headers({
-              'WWW-Authenticate':
-                'Bearer resource_metadata="https://other.example.com/.well-known/oauth-protected-resource"',
-            }),
-          })
-          .mockResolvedValueOnce({
-            ok: true,
-            json: () =>
-              Promise.resolve({
-                resource: 'https://other.example.com/mcp',
-                authorization_servers: ['https://other.example.com'],
-              }),
-          })
-          .mockResolvedValueOnce({
-            ok: true,
-            json: () =>
-              Promise.resolve({
-                issuer: 'https://other.example.com',
-                authorization_endpoint: 'https://other.example.com/authorize',
-                token_endpoint: 'https://other.example.com/token',
-              }),
-          })
+        routeFetch({
+          'https://private.chromatic.com/manifests/components.json': () =>
+            oauthChallenge('https://chromatic.com/.well-known/oauth-protected-resource'),
+          'https://chromatic.com/.well-known/oauth-protected-resource': () =>
+            Response.json(
+              resourceMetadata('https://chromatic.com/mcp', 'https://www.chromatic.com')
+            ),
+          'https://www.chromatic.com/.well-known/oauth-authorization-server': () =>
+            Response.json(serverMetadata('https://www.chromatic.com')),
+          'https://other.example.com/manifests/components.json': () =>
+            oauthChallenge('https://other.example.com/.well-known/oauth-protected-resource'),
+          'https://other.example.com/.well-known/oauth-protected-resource': () =>
+            Response.json(
+              resourceMetadata('https://other.example.com/mcp', 'https://other.example.com')
+            ),
+          'https://other.example.com/.well-known/oauth-authorization-server': () =>
+            Response.json(serverMetadata('https://other.example.com')),
+        })
       );
 
       await auth.initialize([
@@ -810,10 +827,18 @@ describe('CompositionAuth', () => {
         { id: 'other', title: 'Other', url: 'https://other.example.com' },
       ]);
 
-      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('different OAuth server'));
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /"Other" uses a different OAuth server.*https:\/\/www\.chromatic\.com/
+        )
+      );
+      expect(auth.buildWellKnown('http://localhost:6006/mcp')).toMatchObject({
+        authorization_servers: ['https://www.chromatic.com'],
+      });
     });
 
-    it('gracefully skips refs that fail during auth discovery', async () => {
+    it('keeps an unreachable ref listed and says it will be checked again', async () => {
       const auth = new CompositionAuth();
       const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
 
@@ -825,8 +850,9 @@ describe('CompositionAuth', () => {
 
       expect(auth.requiresAuth).toBe(false);
       expect(auth.authUrls).toHaveLength(0);
+      expect(auth.buildSources().map((source) => source.id)).toEqual(['local', 'down']);
       expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining('Skipping composed ref "Down Service"')
+        expect.stringMatching(/"Down Service".*could not be reached.*ECONNREFUSED.*checked again/)
       );
     });
 
@@ -847,10 +873,10 @@ describe('CompositionAuth', () => {
                 'Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource"',
             }),
           })
-          // resource metadata fetch fails
+          // resource metadata is missing
           .mockResolvedValueOnce({
             ok: false,
-            status: 503,
+            status: 404,
           })
       );
 
@@ -888,10 +914,10 @@ describe('CompositionAuth', () => {
                 authorization_servers: ['https://auth.example.com'],
               }),
           })
-          // server metadata fails
+          // server metadata is missing
           .mockResolvedValueOnce({
             ok: false,
-            status: 500,
+            status: 404,
           })
       );
 
@@ -901,6 +927,219 @@ describe('CompositionAuth', () => {
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining('Failed to fetch OAuth server metadata')
       );
+    });
+  });
+
+  describe('refs that are briefly unavailable', () => {
+    const PRIVATE_REF = { id: 'private', title: 'Private', url: 'https://private.example.com' };
+    const PUBLIC_REF = { id: 'public', title: 'Public', url: 'https://public.example.com' };
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.spyOn(logger, 'warn').mockImplementation(() => {});
+      vi.spyOn(logger, 'info').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('picks up the OAuth flow of a private ref that was down at boot', async () => {
+      const auth = new CompositionAuth();
+      const routes = privateRefRoutes(PRIVATE_REF.url);
+      const manifest = routes[`${PRIVATE_REF.url}/manifests/components.json`];
+      let down = true;
+      routes[`${PRIVATE_REF.url}/manifests/components.json`] = (init) => {
+        if (down) throw new TypeError('fetch failed');
+        return manifest(init);
+      };
+      vi.stubGlobal('fetch', routeFetch(routes));
+
+      await auth.initialize([PRIVATE_REF]);
+      expect(auth.requiresAuth).toBe(false);
+      expect(auth.buildSources().map((source) => source.id)).toEqual(['local', 'private']);
+
+      down = false;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await auth.recheckUnreachableRefs();
+
+      expect(auth.requiresAuth).toBe(true);
+      expect(auth.authUrls).toEqual([PRIVATE_REF.url]);
+      expect(auth.buildWellKnown('http://localhost:6006/mcp')).toMatchObject({
+        authorization_servers: ['https://auth.example.com'],
+      });
+      expect(logger.info).toHaveBeenCalledWith(expect.stringMatching(/"Private".*reachable again/));
+    });
+
+    it('treats a 5xx from the manifest as a passing outage, not as a private or missing ref', async () => {
+      const auth = new CompositionAuth();
+      let status = 502;
+      const mockFetch = routeFetch({
+        [`${PUBLIC_REF.url}/manifests/components.json`]: () =>
+          status === 200
+            ? new Response(VALID_MANIFEST, { headers: { 'content-type': 'application/json' } })
+            : new Response('Bad gateway', { status }),
+        // A public Storybook's /mcp may still demand auth; the outage must not be read as that.
+        [`POST ${PUBLIC_REF.url}/mcp`]: () =>
+          oauthChallenge(`${PUBLIC_REF.url}/.well-known/oauth-protected-resource`),
+      });
+      vi.stubGlobal('fetch', mockFetch);
+
+      await auth.initialize([PUBLIC_REF]);
+      expect(auth.requiresAuth).toBe(false);
+      expect(mockFetch).not.toHaveBeenCalledWith(`${PUBLIC_REF.url}/mcp`, expect.anything());
+
+      status = 200;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await auth.recheckUnreachableRefs();
+
+      expect(auth.requiresAuth).toBe(false);
+      expect(auth.buildSources().map((source) => source.id)).toEqual(['local', 'public']);
+    });
+
+    it('treats a 5xx from the OAuth metadata as a passing outage', async () => {
+      const auth = new CompositionAuth();
+      const routes = privateRefRoutes(PRIVATE_REF.url);
+      const metadata = routes['https://auth.example.com/.well-known/oauth-authorization-server'];
+      let down = true;
+      routes['https://auth.example.com/.well-known/oauth-authorization-server'] = (init) =>
+        down ? new Response('Unavailable', { status: 503 }) : metadata(init);
+      vi.stubGlobal('fetch', routeFetch(routes));
+
+      await auth.initialize([PRIVATE_REF]);
+      expect(auth.requiresAuth).toBe(false);
+      expect(auth.buildSources().map((source) => source.id)).toEqual(['local', 'private']);
+
+      down = false;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await auth.recheckUnreachableRefs();
+
+      expect(auth.requiresAuth).toBe(true);
+    });
+
+    it('gives up on a ref that stops answering, then checks it again', async () => {
+      const auth = new CompositionAuth();
+      let stalled = true;
+      vi.stubGlobal(
+        'fetch',
+        routeFetch({
+          [`${PUBLIC_REF.url}/manifests/components.json`]: (init) =>
+            stalled ? hang(init) : new Response(VALID_MANIFEST),
+        })
+      );
+
+      const initialized = auth.initialize([PUBLIC_REF]);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await initialized;
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringMatching(/"Public".*could not be reached.*no data received/)
+      );
+
+      stalled = false;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await auth.recheckUnreachableRefs();
+
+      expect(auth.buildSources().map((source) => source.id)).toEqual(['local', 'public']);
+    });
+
+    it('accepts a large manifest that takes several seconds to stream', async () => {
+      const auth = new CompositionAuth();
+      // A valid manifest padded to ~2 MB, sent in 64 KB chunks 250ms apart: about 8 seconds.
+      const manifest = `${VALID_MANIFEST.slice(0, -1)},"padding":"${'x'.repeat(2 * 1024 * 1024)}"}`;
+      const encoded = new TextEncoder().encode(manifest);
+      vi.stubGlobal(
+        'fetch',
+        routeFetch({
+          [`${PUBLIC_REF.url}/manifests/components.json`]: () =>
+            new Response(
+              new ReadableStream({
+                async start(controller) {
+                  for (let offset = 0; offset < encoded.length; offset += 64 * 1024) {
+                    await new Promise((resolve) => setTimeout(resolve, 250));
+                    controller.enqueue(encoded.slice(offset, offset + 64 * 1024));
+                  }
+                  controller.close();
+                },
+              })
+            ),
+        })
+      );
+
+      const initialized = auth.initialize([PUBLIC_REF]);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await initialized;
+
+      expect(logger.warn).not.toHaveBeenCalled();
+      expect(auth.buildSources().map((source) => source.id)).toEqual(['local', 'public']);
+    });
+
+    it('waits longer after each failure before checking again', async () => {
+      const auth = new CompositionAuth();
+      const mockFetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'));
+      vi.stubGlobal('fetch', mockFetch);
+
+      await auth.initialize([PUBLIC_REF]);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(4_999);
+      await auth.recheckUnreachableRefs();
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await auth.recheckUnreachableRefs();
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(9_999);
+      await auth.recheckUnreachableRefs();
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await auth.recheckUnreachableRefs();
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+      // Warned once, not on every failed retry.
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+    });
+
+    it('shares one round of checks between concurrent requests', async () => {
+      const auth = new CompositionAuth();
+      const mockFetch = vi.fn().mockRejectedValueOnce(new TypeError('fetch failed'));
+      vi.stubGlobal('fetch', mockFetch);
+      await auth.initialize([PUBLIC_REF]);
+
+      mockFetch.mockResolvedValue(new Response(VALID_MANIFEST));
+      await vi.advanceTimersByTimeAsync(5_000);
+      await Promise.all([auth.recheckUnreachableRefs(), auth.recheckUnreachableRefs()]);
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('drops a ref that turns out to have no manifest once it is reachable', async () => {
+      const auth = new CompositionAuth();
+      const mockFetch = vi.fn().mockRejectedValueOnce(new TypeError('fetch failed'));
+      vi.stubGlobal('fetch', mockFetch);
+      await auth.initialize([PUBLIC_REF]);
+      expect(auth.buildSources().map((source) => source.id)).toEqual(['local', 'public']);
+
+      mockFetch.mockImplementation(async () => new Response('Not found', { status: 404 }));
+      await vi.advanceTimersByTimeAsync(5_000);
+      await auth.recheckUnreachableRefs();
+
+      expect(auth.buildSources().map((source) => source.id)).toEqual(['local']);
+      expect(logger.warn).toHaveBeenLastCalledWith(
+        expect.stringMatching(/Skipping composed ref "Public".*components manifest not found/)
+      );
+    });
+
+    it('does not check refs again once their state is known', async () => {
+      const auth = new CompositionAuth();
+      const mockFetch = vi.fn().mockResolvedValue(new Response(VALID_MANIFEST));
+      vi.stubGlobal('fetch', mockFetch);
+      await auth.initialize([PUBLIC_REF]);
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      await auth.recheckUnreachableRefs();
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
     });
   });
 });
