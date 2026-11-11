@@ -35,14 +35,17 @@ function serverMetadata(issuer: string) {
   };
 }
 
-function privateRefRoutes(refUrl: string): Record<string, Route> {
+function privateRefRoutes(
+  refUrl: string,
+  authServer = 'https://auth.example.com'
+): Record<string, Route> {
   return {
     [`${refUrl}/manifests/components.json`]: () =>
       oauthChallenge(`${refUrl}/.well-known/oauth-protected-resource`),
     [`${refUrl}/.well-known/oauth-protected-resource`]: () =>
-      Response.json(resourceMetadata(`${refUrl}/mcp`, 'https://auth.example.com')),
-    'https://auth.example.com/.well-known/oauth-authorization-server': () =>
-      Response.json(serverMetadata('https://auth.example.com')),
+      Response.json(resourceMetadata(`${refUrl}/mcp`, authServer)),
+    [`${authServer}/.well-known/oauth-authorization-server`]: () =>
+      Response.json(serverMetadata(authServer)),
   };
 }
 
@@ -1032,6 +1035,102 @@ describe('CompositionAuth', () => {
       expect(mockFetch).toHaveBeenCalledTimes(3);
       // Warned once, not on every failed retry.
       expect(logger.warn).toHaveBeenCalledTimes(1);
+    });
+    it('fails fast for a ref waiting for a re-check, then fetches it again once it recovers', async () => {
+      const auth = new CompositionAuth();
+      let down = true;
+      const mockFetch = routeFetch({
+        [`${PUBLIC_REF.url}/manifests/components.json`]: () => {
+          if (down) throw new TypeError('fetch failed');
+          return new Response(VALID_MANIFEST);
+        },
+      });
+      vi.stubGlobal('fetch', mockFetch);
+      await auth.initialize([PUBLIC_REF]);
+      const provider = auth.createManifestProvider('http://localhost:6006');
+      const source = auth.buildSources().find((s) => s.id === 'public');
+      mockFetch.mockClear();
+
+      await expect(provider(undefined, './manifests/components.json', source)).rejects.toThrow(
+        /"Public" is temporarily unreachable/
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      down = false;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await auth.recheckUnreachableRefs();
+
+      await expect(provider(undefined, './manifests/components.json', source)).resolves.toBe(
+        VALID_MANIFEST
+      );
+    });
+
+    it.each([503, 429, 408])(
+      'treats a %i from the /mcp fallback as a passing outage',
+      async (status) => {
+        const auth = new CompositionAuth();
+        let down = true;
+        const routes = privateRefRoutes(PRIVATE_REF.url);
+        const challenge = routes[`${PRIVATE_REF.url}/manifests/components.json`];
+        routes[`${PRIVATE_REF.url}/manifests/components.json`] = () =>
+          new Response('<html>Sign in</html>');
+        routes[`POST ${PRIVATE_REF.url}/mcp`] = (init) =>
+          down ? new Response('Unavailable', { status }) : challenge(init);
+        vi.stubGlobal('fetch', routeFetch(routes));
+
+        await auth.initialize([PRIVATE_REF]);
+        expect(auth.buildSources().map((source) => source.id)).toEqual(['local', 'private']);
+
+        down = false;
+        await vi.advanceTimersByTimeAsync(5_000);
+        await auth.recheckUnreachableRefs();
+
+        expect(auth.authUrls).toEqual([PRIVATE_REF.url]);
+      }
+    );
+
+    it('excludes a ref without a manifest whose host answers the /mcp fallback with 501', async () => {
+      const auth = new CompositionAuth();
+      vi.stubGlobal(
+        'fetch',
+        routeFetch({
+          [`${PUBLIC_REF.url}/manifests/components.json`]: () => new Response('<html></html>'),
+          [`POST ${PUBLIC_REF.url}/mcp`]: () => new Response('Unsupported', { status: 501 }),
+        })
+      );
+
+      await auth.initialize([PUBLIC_REF]);
+
+      expect(auth.buildSources().map((source) => source.id)).toEqual(['local']);
+    });
+
+    it('keeps the first OAuth server when an earlier private ref recovers', async () => {
+      const auth = new CompositionAuth();
+      const refA = { id: 'a', title: 'A', url: 'https://a.example.com' };
+      const refB = { id: 'b', title: 'B', url: 'https://b.example.com' };
+      const routesA = privateRefRoutes(refA.url, 'https://auth-a.example.com');
+      const challengeA = routesA[`${refA.url}/manifests/components.json`];
+      let down = true;
+      routesA[`${refA.url}/manifests/components.json`] = (init) => {
+        if (down) throw new TypeError('fetch failed');
+        return challengeA(init);
+      };
+      vi.stubGlobal(
+        'fetch',
+        routeFetch({ ...routesA, ...privateRefRoutes(refB.url, 'https://auth-b.example.com') })
+      );
+
+      await auth.initialize([refA, refB]);
+      down = false;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await auth.recheckUnreachableRefs();
+
+      expect(auth.buildWellKnown('http://localhost:6006/mcp')).toMatchObject({
+        authorization_servers: ['https://auth-b.example.com'],
+      });
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringMatching(/"A" uses a different OAuth server \(https:\/\/auth-a/)
+      );
     });
   });
 });
